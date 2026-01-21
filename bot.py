@@ -1,16 +1,15 @@
 import asyncio
+import getpass
+import json
 import logging
 import re
 import sys
-import json
-import qrcode
-from io import BytesIO
 from pathlib import Path
 from typing import Set, Dict, Any
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     ChannelInvalidError, ChannelPrivateError, 
@@ -38,11 +37,6 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.json'
 SESSION_FILE = 'telethon_session.session'
 
-# Глобальные переменные
-telethon_client = None
-telethon_ready = False
-user_sessions = {}  # Для хранения временных данных авторизации
-
 # Регулярное выражение для поиска Telegram ссылок
 TELEGRAM_LINK_REGEX = r'https?://t\.me/([a-zA-Z0-9_]+)'
 
@@ -68,6 +62,90 @@ class TelethonManager:
         """Сохраняет конфигурацию в файл"""
         with open(CONFIG_FILE, 'w') as f:
             json.dump(self.config, f, indent=2)
+
+    async def _is_session_valid(self, client: TelegramClient) -> bool:
+        """Проверяет авторизацию для переданного клиента"""
+        try:
+            await client.connect()
+            return await client.is_user_authorized()
+        except Exception as e:
+            logger.error(f"Ошибка проверки сессии: {e}")
+            return False
+        finally:
+            await client.disconnect()
+
+    async def ensure_terminal_session(self) -> bool:
+        """Гарантирует регистрацию сессии через терминал перед запуском"""
+        self.config = self.load_config()
+
+        if Path(SESSION_FILE).exists():
+            file_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+            if await self._is_session_valid(file_client):
+                logger.info("✅ Найдена валидная сессия Telethon в файле")
+                return True
+
+        string_session = self.config.get('string_session')
+        if string_session:
+            string_client = TelegramClient(StringSession(string_session), API_ID, API_HASH)
+            if await self._is_session_valid(string_client):
+                logger.info("✅ Найдена валидная строковая сессия Telethon")
+                return True
+            self.config['string_session'] = ''
+            self.save_config()
+
+        print("🔐 Сессия Telethon не найдена. Требуется регистрация в терминале.")
+        return await self._register_session_via_terminal()
+
+    async def _register_session_via_terminal(self) -> bool:
+        """Создает сессию Telethon через терминал"""
+        if not sys.stdin.isatty():
+            print("❌ Нет доступа к интерактивному терминалу для регистрации сессии.")
+            return False
+
+        phone = input("Введите номер телефона в международном формате (пример: +79123456789): ").strip()
+        if not phone:
+            print("❌ Номер телефона не задан.")
+            return False
+
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+
+        try:
+            await client.send_code_request(phone)
+            attempts = 0
+            while True:
+                code = input("Введите код из Telegram (5 цифр): ").strip()
+                if not code:
+                    print("❌ Код не введен.")
+                    continue
+                try:
+                    await client.sign_in(phone=phone, code=code)
+                    break
+                except PhoneCodeInvalidError:
+                    attempts += 1
+                    if attempts >= 3:
+                        print("❌ Слишком много неверных попыток.")
+                        return False
+                    print("❌ Неверный код. Попробуйте снова.")
+                except PhoneCodeExpiredError:
+                    print("⏳ Код истек. Отправляю новый код...")
+                    await client.send_code_request(phone)
+                except SessionPasswordNeededError:
+                    password = getpass.getpass("Введите пароль двухфакторной аутентификации: ")
+                    try:
+                        await client.sign_in(password=password)
+                        break
+                    except Exception as e:
+                        print(f"❌ Ошибка пароля 2FA: {e}")
+                        return False
+
+            string_session = client.session.save()
+            self.config['string_session'] = string_session
+            self.save_config()
+            print("✅ Сессия сохранена в config.json")
+            return True
+        finally:
+            await client.disconnect()
     
     async def initialize(self):
         """Инициализирует клиент Telethon"""
@@ -81,8 +159,8 @@ class TelethonManager:
                     logger.info("✅ Telethon авторизован с файлом сессии")
                     self.ready = True
                     return True
-                else:
-                    logger.warning("Файл сессии устарел")
+                logger.warning("Файл сессии устарел")
+                await self.client.disconnect()
             
             # Проверяем есть ли строковая сессия в конфиге
             if 'string_session' in self.config and self.config['string_session']:
@@ -95,8 +173,11 @@ class TelethonManager:
                         logger.info("✅ Telethon авторизован со строковой сессией")
                         self.ready = True
                         return True
+                    await self.client.disconnect()
                 except Exception as e:
                     logger.error(f"Ошибка строковой сессии: {e}")
+                    if self.client:
+                        await self.client.disconnect()
             
             logger.warning("Telethon не авторизован")
             self.client = None
@@ -106,7 +187,7 @@ class TelethonManager:
             logger.error(f"Ошибка инициализации Telethon: {e}")
             return False
     
-    async def authorize_with_phone(self, update: Update) -> bool:
+    async def authorize_with_phone(self, update: Update, context: CallbackContext) -> bool:
         """Авторизация по номеру телефона через бота"""
         try:
             user_id = update.effective_user.id
@@ -125,13 +206,18 @@ class TelethonManager:
             
             # Ждем номер телефона
             try:
-                phone_message = await self.wait_for_user_message(user_id, timeout=60)
+                phone_message = await self.wait_for_user_message(
+                    user_id,
+                    chat_id,
+                    context.application,
+                    timeout=60
+                )
                 phone = phone_message.text.strip()
                 
                 # Отправляем запрос на код
                 await update.message.reply_text(f"📲 Отправляю код на номер {phone}...")
-                
-                sent_code = await self.client.send_code_request(phone)
+
+                await self.client.send_code_request(phone)
                 
                 await update.message.reply_text(
                     "✅ Код отправлен!\n\n"
@@ -139,7 +225,12 @@ class TelethonManager:
                 )
                 
                 # Ждем код
-                code_message = await self.wait_for_user_message(user_id, timeout=120)
+                code_message = await self.wait_for_user_message(
+                    user_id,
+                    chat_id,
+                    context.application,
+                    timeout=120
+                )
                 code = code_message.text.strip()
                 
                 # Пробуем войти
@@ -149,7 +240,12 @@ class TelethonManager:
                 except SessionPasswordNeededError:
                     await update.message.reply_text("🔐 Требуется пароль двухфакторной аутентификации:")
                     
-                    password_message = await self.wait_for_user_message(user_id, timeout=60)
+                    password_message = await self.wait_for_user_message(
+                        user_id,
+                        chat_id,
+                        context.application,
+                        timeout=60
+                    )
                     password = password_message.text.strip()
                     
                     await self.client.sign_in(password=password)
@@ -178,23 +274,31 @@ class TelethonManager:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
             return False
     
-    async def wait_for_user_message(self, user_id: int, timeout: int = 60):
+    async def wait_for_user_message(
+        self,
+        user_id: int,
+        chat_id: int,
+        application: Application,
+        timeout: int = 60
+    ):
         """Ожидает сообщение от пользователя"""
-        future = asyncio.get_event_loop().create_future()
-        
+        future = asyncio.get_running_loop().create_future()
+
         def handler(upd: Update, ctx: CallbackContext):
-            if upd.effective_user.id == user_id:
+            if future.done():
+                return
+            if not upd.effective_user or not upd.effective_chat:
+                return
+            if upd.effective_user.id == user_id and upd.effective_chat.id == chat_id:
                 future.set_result(upd.message)
-        
-        # Временный хендлер
-        app = Application.builder().token(BOT_TOKEN).build()
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
-        
+
+        temp_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handler)
+        application.add_handler(temp_handler, group=1)
+
         try:
             return await asyncio.wait_for(future, timeout)
         finally:
-            # Удаляем хендлер
-            pass
+            application.remove_handler(temp_handler, group=1)
     
     async def test_connection(self) -> bool:
         """Проверяет соединение Telethon"""
@@ -210,6 +314,13 @@ class TelethonManager:
             logger.error(f"Ошибка проверки соединения: {e}")
         
         return False
+
+    async def close(self):
+        """Закрывает подключение Telethon"""
+        if self.client:
+            await self.client.disconnect()
+            self.client = None
+            self.ready = False
 
 # Создаем менеджер
 telethon_manager = TelethonManager()
@@ -278,7 +389,7 @@ async def start(update: Update, context: CallbackContext) -> None:
         f"👋 Привет, {user.first_name}!\n\n"
         f"📊 Статус Telethon: {telethon_status}\n\n"
         "📁 *Как использовать:*\n"
-        "1. Сначала авторизуйте Telethon: /auth_telethon\n"
+        "1. Сессия Telethon регистрируется в терминале перед запуском\n"
         "2. Отправьте .txt файл со ссылками\n"
         "3. Получите файл с рабочими ссылками\n\n"
         "🔗 Формат ссылок в файле:\n"
@@ -305,7 +416,7 @@ async def auth_telethon(update: Update, context: CallbackContext) -> None:
 
 async def auth_phone(update: Update, context: CallbackContext) -> None:
     """Авторизация по номеру телефона"""
-    success = await telethon_manager.authorize_with_phone(update)
+    success = await telethon_manager.authorize_with_phone(update, context)
     if success:
         await update.message.reply_text("✅ Авторизация успешна! Теперь можете отправлять файлы.")
 
@@ -316,7 +427,7 @@ async def check_status(update: Update, context: CallbackContext) -> None:
     else:
         await update.message.reply_text(
             "❌ Telethon не авторизован\n"
-            "Используйте /auth_telethon для авторизации"
+            "Используйте /auth_telethon или перезапустите бота для регистрации в терминале"
         )
 
 async def test_connection(update: Update, context: CallbackContext) -> None:
@@ -467,7 +578,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/test_connection - Тест соединения\n"
         "/help - Эта справка\n\n"
         "*Как использовать:*\n"
-        "1. Авторизуйте Telethon\n"
+        "1. Зарегистрируйте сессию Telethon в терминале перед запуском\n"
         "2. Отправьте .txt файл со ссылками\n"
         "3. Получите результат\n\n"
         "*Формат файла:*\n"
@@ -484,12 +595,43 @@ async def cancel(update: Update, context: CallbackContext) -> None:
 async def handle_text(update: Update, context: CallbackContext) -> None:
     """Обработчик текста"""
     text = update.message.text
-    if TELEGRAM_LINK_REGEX.match(text):
+    if text and re.search(TELEGRAM_LINK_REGEX, text):
         await update.message.reply_text("✅ Ссылка проверена!")  # Дополнительно, можно добавить проверку каждой ссылки напрямую
+
+async def on_startup(app: Application):
+    """Запуск Telethon при старте бота"""
+    await telethon_manager.initialize()
+
+
+async def on_shutdown(app: Application):
+    """Отключение Telethon при остановке бота"""
+    await telethon_manager.close()
+
+
+def ensure_session_before_bot_start() -> bool:
+    """Проверяет/регистрирует сессию перед запуском бота"""
+    try:
+        return asyncio.run(telethon_manager.ensure_terminal_session())
+    except KeyboardInterrupt:
+        print("\n❌ Регистрация сессии прервана пользователем.")
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка регистрации сессии: {e}")
+        return False
+
 
 def main():
     """Основная функция запуска бота"""
-    app = Application.builder().token(BOT_TOKEN).build()
+    if not ensure_session_before_bot_start():
+        sys.exit(1)
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     # Регистрируем команды
     app.add_handler(CommandHandler("start", start))
@@ -509,4 +651,4 @@ def main():
     app.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
