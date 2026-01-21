@@ -11,6 +11,7 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
+    FloodWaitError,
 )
 from telethon.sessions import StringSession
 
@@ -48,6 +49,30 @@ def prompt_phone_number() -> str:
         return phone
 
 
+def describe_delivery(sent_code) -> str:
+    if not sent_code or not getattr(sent_code, "type", None):
+        return "Code was sent. Delivery type is unknown."
+    type_name = sent_code.type.__class__.__name__
+    if type_name == "SentCodeTypeApp":
+        return "Code was sent to Telegram app (chat from Telegram)."
+    if type_name == "SentCodeTypeSms":
+        return "Code was sent via SMS."
+    if type_name == "SentCodeTypeCall":
+        return "Code will arrive via a phone call."
+    if type_name == "SentCodeTypeFlashCall":
+        return "Code will arrive via flash call."
+    if type_name == "SentCodeTypeFragmentSms":
+        return "Code was sent via fragment SMS."
+    return f"Code was sent. Delivery type: {type_name}."
+
+
+async def send_code(client: TelegramClient, phone: str, force_sms: bool = False):
+    try:
+        return await client.send_code_request(phone, force_sms=force_sms)
+    except TypeError:
+        return await client.send_code_request(phone)
+
+
 async def create_session() -> bool:
     if not sys.stdin.isatty():
         print("Interactive terminal is required to create a session.")
@@ -61,16 +86,35 @@ async def create_session() -> bool:
         while True:
             phone = prompt_phone_number()
             try:
-                await client.send_code_request(phone)
+                sent_code = await send_code(client, phone, force_sms=False)
+                print(describe_delivery(sent_code))
+                timeout = getattr(sent_code, "timeout", None)
+                if timeout:
+                    print(f"If the code did not arrive, wait {timeout} seconds before retrying.")
                 break
             except PhoneNumberInvalidError:
                 print("Phone number is invalid. Try again.")
+            except FloodWaitError as exc:
+                print(f"Too many requests. Wait {exc.seconds} seconds and retry.")
+                return False
 
         attempts = 0
         while True:
-            code = input("Enter the code from Telegram: ").strip()
+            code = input("Enter the code from Telegram (or type 'resend'/'sms'): ").strip()
             if not code:
                 print("Code is required.")
+                continue
+            if code.lower() in ("resend", "r", "sms"):
+                force_sms = code.lower() == "sms"
+                try:
+                    sent_code = await send_code(client, phone, force_sms=force_sms)
+                    print(describe_delivery(sent_code))
+                    timeout = getattr(sent_code, "timeout", None)
+                    if timeout:
+                        print(f"Wait {timeout} seconds before retrying.")
+                except FloodWaitError as exc:
+                    print(f"Too many requests. Wait {exc.seconds} seconds and retry.")
+                    return False
                 continue
             try:
                 await client.sign_in(phone=phone, code=code)
