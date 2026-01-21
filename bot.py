@@ -1,9 +1,7 @@
 import asyncio
-import getpass
 import json
 import logging
 import re
-import sys
 from pathlib import Path
 from typing import Set, Dict, Any
 
@@ -12,9 +10,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
-    ChannelInvalidError, ChannelPrivateError, 
-    UsernameInvalidError, SessionPasswordNeededError,
-    PhoneCodeInvalidError, PhoneCodeExpiredError
+    ChannelInvalidError, ChannelPrivateError,
+    UsernameInvalidError, SessionPasswordNeededError
 )
 
 # === КОНСТАНТЫ ===
@@ -63,93 +60,10 @@ class TelethonManager:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(self.config, f, indent=2)
 
-    async def _is_session_valid(self, client: TelegramClient) -> bool:
-        """Проверяет авторизацию для переданного клиента"""
-        try:
-            await client.connect()
-            return await client.is_user_authorized()
-        except Exception as e:
-            logger.error(f"Ошибка проверки сессии: {e}")
-            return False
-        finally:
-            await client.disconnect()
-
-    async def ensure_terminal_session(self) -> bool:
-        """Гарантирует регистрацию сессии через терминал перед запуском"""
-        self.config = self.load_config()
-
-        if Path(SESSION_FILE).exists():
-            file_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-            if await self._is_session_valid(file_client):
-                logger.info("✅ Найдена валидная сессия Telethon в файле")
-                return True
-
-        string_session = self.config.get('string_session')
-        if string_session:
-            string_client = TelegramClient(StringSession(string_session), API_ID, API_HASH)
-            if await self._is_session_valid(string_client):
-                logger.info("✅ Найдена валидная строковая сессия Telethon")
-                return True
-            self.config['string_session'] = ''
-            self.save_config()
-
-        print("🔐 Сессия Telethon не найдена. Требуется регистрация в терминале.")
-        return await self._register_session_via_terminal()
-
-    async def _register_session_via_terminal(self) -> bool:
-        """Создает сессию Telethon через терминал"""
-        if not sys.stdin.isatty():
-            print("❌ Нет доступа к интерактивному терминалу для регистрации сессии.")
-            return False
-
-        phone = input("Введите номер телефона в международном формате (пример: +79123456789): ").strip()
-        if not phone:
-            print("❌ Номер телефона не задан.")
-            return False
-
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-
-        try:
-            await client.send_code_request(phone)
-            attempts = 0
-            while True:
-                code = input("Введите код из Telegram (5 цифр): ").strip()
-                if not code:
-                    print("❌ Код не введен.")
-                    continue
-                try:
-                    await client.sign_in(phone=phone, code=code)
-                    break
-                except PhoneCodeInvalidError:
-                    attempts += 1
-                    if attempts >= 3:
-                        print("❌ Слишком много неверных попыток.")
-                        return False
-                    print("❌ Неверный код. Попробуйте снова.")
-                except PhoneCodeExpiredError:
-                    print("⏳ Код истек. Отправляю новый код...")
-                    await client.send_code_request(phone)
-                except SessionPasswordNeededError:
-                    password = getpass.getpass("Введите пароль двухфакторной аутентификации: ")
-                    try:
-                        await client.sign_in(password=password)
-                        break
-                    except Exception as e:
-                        print(f"❌ Ошибка пароля 2FA: {e}")
-                        return False
-
-            string_session = client.session.save()
-            self.config['string_session'] = string_session
-            self.save_config()
-            print("✅ Сессия сохранена в config.json")
-            return True
-        finally:
-            await client.disconnect()
-    
     async def initialize(self):
         """Инициализирует клиент Telethon"""
         try:
+            self.config = self.load_config()
             # Пробуем загрузить существующую сессию
             if Path(SESSION_FILE).exists():
                 self.client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
@@ -389,7 +303,7 @@ async def start(update: Update, context: CallbackContext) -> None:
         f"👋 Привет, {user.first_name}!\n\n"
         f"📊 Статус Telethon: {telethon_status}\n\n"
         "📁 *Как использовать:*\n"
-        "1. Сессия Telethon регистрируется в терминале перед запуском\n"
+        "1. Запустите create_session.py в терминале для авторизации\n"
         "2. Отправьте .txt файл со ссылками\n"
         "3. Получите файл с рабочими ссылками\n\n"
         "🔗 Формат ссылок в файле:\n"
@@ -427,7 +341,7 @@ async def check_status(update: Update, context: CallbackContext) -> None:
     else:
         await update.message.reply_text(
             "❌ Telethon не авторизован\n"
-            "Используйте /auth_telethon или перезапустите бота для регистрации в терминале"
+            "Запустите create_session.py или используйте /auth_telethon"
         )
 
 async def test_connection(update: Update, context: CallbackContext) -> None:
@@ -578,7 +492,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/test_connection - Тест соединения\n"
         "/help - Эта справка\n\n"
         "*Как использовать:*\n"
-        "1. Зарегистрируйте сессию Telethon в терминале перед запуском\n"
+        "1. Запустите create_session.py в терминале для авторизации\n"
         "2. Отправьте .txt файл со ссылками\n"
         "3. Получите результат\n\n"
         "*Формат файла:*\n"
@@ -608,23 +522,8 @@ async def on_shutdown(app: Application):
     await telethon_manager.close()
 
 
-def ensure_session_before_bot_start() -> bool:
-    """Проверяет/регистрирует сессию перед запуском бота"""
-    try:
-        return asyncio.run(telethon_manager.ensure_terminal_session())
-    except KeyboardInterrupt:
-        print("\n❌ Регистрация сессии прервана пользователем.")
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка регистрации сессии: {e}")
-        return False
-
-
 def main():
     """Основная функция запуска бота"""
-    if not ensure_session_before_bot_start():
-        sys.exit(1)
-
     app = (
         Application.builder()
         .token(BOT_TOKEN)

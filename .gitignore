@@ -201,6 +201,10 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Telethon sessions
+config.json
+telethon_session.session
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
